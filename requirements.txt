@@ -2,4 +2,6 @@ opencv-python
 deepface
 retina-face
 numpy
-
+scipy
+scikit-learn
+matplotlib
