@@ -1,5 +1,3 @@
-
-
 import argparse
 import csv
 import os
@@ -15,8 +13,7 @@ from sklearn.metrics import (
 
 # Reuse the actual recognition pipeline from the project instead of
 # reimplementing matching logic here — we want to evaluate the real system.
-import detect  # noqa: E402  (detect.py lives at repo root)
-
+import detect  # noqa: E402 (detect.py lives at repo root)
 
 UNKNOWN_LABEL = "unknown"
 
@@ -31,37 +28,58 @@ def load_labels(labels_csv):
     return rows
 
 
-def predict_identity(image_path):
-    
+def predict_identity(image_path, db):
+    """
+    FIXED — the original version called detect.detect_faces(img) and
+    detect.recognize_face(img, face_box), neither of which existed in
+    detect.py (it would have raised AttributeError on the first call).
+    It also never loaded a face database at all, so even with the right
+    function names there'd have been no `db` to match against.
+
+    Both functions now exist in detect.py and are used the same way the
+    live webcam pipeline uses them, so this evaluates the real system
+    rather than a reimplementation of it.
+    """
     img = cv2.imread(image_path)
     if img is None:
         raise FileNotFoundError(image_path)
 
     faces = detect.detect_faces(img)  # Haar cascade detection
-    if not faces:
+    if len(faces) == 0:
         return UNKNOWN_LABEL
 
     # Evaluate on the largest detected face (most images in a test set
     # of this kind are single-subject).
     face_box = max(faces, key=lambda b: b[2] * b[3])
-    name, score = detect.recognize_face(img, face_box)  # ArcFace + cosine sim
 
+    name, score = detect.recognize_face(img, face_box, db)  # ArcFace + cosine sim
     if name is None or score < detect.ARCFACE_THRESHOLD:
         return UNKNOWN_LABEL
+
     return name
 
 
-def run_evaluation(test_dir, labels_csv, out_dir):
+def run_evaluation(test_dir, labels_csv, out_dir, db_dir="database"):
     os.makedirs(out_dir, exist_ok=True)
-    rows = load_labels(labels_csv)
 
+    # This was missing entirely in the original file — predict_identity()
+    # referenced a `db` variable that was never defined anywhere.
+    db = detect.load_criminals(db_dir)
+    if not db:
+        print(
+            f"[WARN] No reference faces loaded from '{db_dir}/'. "
+            "Every prediction will be 'unknown'. Add photos to that folder first.",
+            file=sys.stderr,
+        )
+
+    rows = load_labels(labels_csv)
     y_true, y_pred, filenames = [], [], []
     errors = []
 
     for filename, true_label in rows:
         path = os.path.join(test_dir, filename)
         try:
-            pred = predict_identity(path)
+            pred = predict_identity(path, db)
         except Exception as e:
             print(f"[skip] {filename}: {e}", file=sys.stderr)
             continue
@@ -72,6 +90,10 @@ def run_evaluation(test_dir, labels_csv, out_dir):
 
         if pred != true_label:
             errors.append((filename, true_label, pred))
+
+    if not y_true:
+        print("[ERROR] No images were evaluated — check test_dir/labels.csv paths.", file=sys.stderr)
+        return
 
     labels_sorted = sorted(set(y_true) | set(y_pred))
 
@@ -133,6 +155,7 @@ if __name__ == "__main__":
     parser.add_argument("--test-dir", default="test_set", help="Directory containing test images")
     parser.add_argument("--labels", default="test_set/labels.csv", help="CSV with filename,true_identity")
     parser.add_argument("--out-dir", default="eval_results", help="Where to write report/confusion matrix")
+    parser.add_argument("--db-dir", default="database", help="Directory of reference face photos (same as detect.py uses)")
     args = parser.parse_args()
 
-    run_evaluation(args.test_dir, args.labels, args.out_dir)
+    run_evaluation(args.test_dir, args.labels, args.out_dir, args.db_dir)
