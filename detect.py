@@ -1,32 +1,31 @@
 # ============================================================
 # CCTV Criminal Detection — detect.py
-#
-# PATCH NOTES (for Evaluate.py integration):
-#   - face_detector is now created once at module level instead of
-#     inside run_detection(), so other modules (Evaluate.py) can reuse
-#     the exact same Haar cascade instance.
-#   - Added detect_faces(img) and recognize_face(img, box, db) as
-#     reusable top-level functions. These wrap the same logic that was
-#     previously inlined in run_detection()/recognize_arcface(), so
-#     live-pipeline behavior is unchanged — Evaluate.py now calls real
-#     functions instead of detect.detect_faces / detect.recognize_face
-#     that never existed before.
 # ============================================================
 import cv2
 import os
 import json
 import datetime
 import threading
+import urllib.request
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # --- CONFIGURATION ---
 ARCFACE_THRESHOLD = 0.50
 PIXEL_THRESHOLD = 70
-STICKY_FRAMES = 20       # Keeps a name label visible for ~0.7s after the last positive match
-RECOG_EVERY = 2          # Only run the (expensive) recognition model every 2nd frame
-COOLDOWN_SEC = 10        # Minimum gap between snapshots of the same person
+STICKY_FRAMES = 20      # Keeps a name label visible for ~0.7s after the last positive match
+RECOG_EVERY = 2         # Only run the (expensive) recognition model every 2nd frame
+COOLDOWN_SEC = 10       # Minimum gap between snapshots of the same person
 DASHBOARD_HTML_PATH = "dashboard.html"
+
+YUNET_MODEL_PATH = "models/face_detection_yunet_2023mar.onnx"
+YUNET_MODEL_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/"
+    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+YUNET_SCORE_THRESHOLD = 0.7
+YUNET_NMS_THRESHOLD = 0.3
+YUNET_TOP_K = 5000
 
 try:
     from deepface import DeepFace
@@ -36,10 +35,38 @@ except ImportError:
     ARCFACE_AVAILABLE = False
     print("[INFO] DeepFace not found. Using pixel-difference fallback.")
 
-# Module-level cascade so Evaluate.py (and anything else) can reuse it
-# without spinning up a second copy or duplicating the XML path lookup.
-_face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+
+def _ensure_yunet_model():
+    """Downloads the YuNet ONNX weights on first run if not already present."""
+    if os.path.exists(YUNET_MODEL_PATH):
+        return
+    os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True)
+    print("[YuNet] Model weights not found locally, downloading (~340KB)...")
+    try:
+        urllib.request.urlretrieve(YUNET_MODEL_URL, YUNET_MODEL_PATH)
+        print(f"[YuNet] Saved to {YUNET_MODEL_PATH}")
+    except Exception as e:
+        raise RuntimeError(
+            f"[YuNet] Could not download model weights automatically ({e}). "
+            f"Manually download face_detection_yunet_2023mar.onnx from "
+            f"{YUNET_MODEL_URL} and place it at {YUNET_MODEL_PATH}."
+        )
+
+
+_ensure_yunet_model()
+
+# Module-level detector so Evaluate.py (and anything else) can reuse it
+# without spinning up a second copy or duplicating the model-path lookup.
+# input_size is a placeholder here — it gets updated per-frame in
+# detect_faces() via setInputSize(), since YuNet needs to know the
+# actual frame resolution before each forward pass.
+_face_detector = cv2.FaceDetectorYN.create(
+    YUNET_MODEL_PATH,
+    "",
+    (320, 320),
+    score_threshold=YUNET_SCORE_THRESHOLD,
+    nms_threshold=YUNET_NMS_THRESHOLD,
+    top_k=YUNET_TOP_K,
 )
 
 shared = {
@@ -62,9 +89,9 @@ lock = threading.Lock()
 # ============================================================
 class FaceTracker:
     """
-    detectMultiScale doesn't guarantee the same ordering of faces between
-    frames, so indexing faces by their position in that frame's result list
-    isn't a stable identity — two people can swap labels just by moving.
+    Detection order isn't guaranteed to be stable between frames, so
+    indexing faces by their position in that frame's result list isn't
+    a stable identity — two people can swap labels just by moving.
     This assigns each face a persistent ID by matching it to the closest
     tracked face from the previous frame (within max_distance pixels).
     A face that goes unmatched for too many frames in a row is dropped.
@@ -171,15 +198,33 @@ def load_criminals(folder="database"):
 
 def detect_faces(img):
     """
-    Run Haar Cascade face detection on a BGR image and return a list of
-    (x, y, w, h) boxes. Pulled out as a standalone function (it used to
-    be inlined inside run_detection()'s while loop) so Evaluate.py and
-    any future script can detect faces the exact same way the live
-    pipeline does, instead of reimplementing it.
+    Run YuNet face detection on a BGR image and return a list of
+    (x, y, w, h) boxes — same return shape as the old Haar Cascade
+    version, so FaceTracker / recognize_face / Evaluate.py all keep
+    working unchanged.
+
+    YuNet needs setInputSize() called with the current frame's (w, h)
+    before each detect() call, since unlike Haar it isn't resolution
+    agnostic out of the box.
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    boxes = _face_cascade.detectMultiScale(gray, 1.05, 4, minSize=(60, 60))
-    return list(boxes)
+    h, w = img.shape[:2]
+    _face_detector.setInputSize((w, h))
+    _, faces = _face_detector.detect(img)
+
+    if faces is None:
+        return []
+
+    boxes = []
+    for f in faces:
+        # f = [x, y, w, h, <5 landmark x,y pairs>, confidence]
+        x, y, bw, bh = f[0:4]
+        boxes.append((
+            max(0, int(round(x))),
+            max(0, int(round(y))),
+            int(round(bw)),
+            int(round(bh)),
+        ))
+    return boxes
 
 
 def cosine_similarity(a, b):
@@ -211,18 +256,21 @@ def recognize_arcface(face_bgr, db):
             return best_name, max(0, min(99, conf))
     except Exception as e:
         print(f"[WARN] ArcFace recognition failed: {e}")
+
     return None, 0
 
 
 def recognize_pixel(face_gray, db):
     best_name, best_score = None, 999
     face_r = cv2.resize(face_gray, (100, 100))
+
     for c in db:
         score = float(cv2.absdiff(face_r, cv2.resize(c["photo"], (100, 100))).mean())
         if score < best_score:
             best_score = score
             if score < PIXEL_THRESHOLD:
                 best_name = c["name"]
+
     if best_name:
         return best_name, max(0, min(99, int((1 - best_score / PIXEL_THRESHOLD) * 100)))
     return None, 0
@@ -264,18 +312,19 @@ def recognize_face(img, box, db):
             sim = cosine_similarity(live_emb, c["embedding"])
             if sim > best_score:
                 best_score = sim
-                best_name = c["name"] if sim >= ARCFACE_THRESHOLD else None
+            best_name = c["name"] if sim >= ARCFACE_THRESHOLD else None
         return best_name, best_score
-
     else:
         gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
         face_r = cv2.resize(gray, (100, 100))
         best_name, best_score = None, 999
+
         for c in db:
             score = float(cv2.absdiff(face_r, cv2.resize(c["photo"], (100, 100))).mean())
             if score < best_score:
                 best_score = score
-                best_name = c["name"] if score < PIXEL_THRESHOLD else None
+            best_name = c["name"] if score < PIXEL_THRESHOLD else None
+
         # Return a "similarity-like" score (higher = better) for consistency,
         # even though pixel-diff is naturally a distance (lower = better).
         normalized = max(0.0, 1.0 - best_score / PIXEL_THRESHOLD) if best_score < 999 else 0.0
@@ -297,6 +346,7 @@ def log_detection(face_id, name, is_criminal, conf, algo_label):
     no update, otherwise the same face would fill the log 30x a second.
     """
     now_dt = datetime.datetime.now()
+
     with lock:
         last_for_face = next(
             (d for d in reversed(shared["detections"]) if d.get("face_id") == face_id),
@@ -344,6 +394,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = self._path()
+
         if p in ("/", "/index.html"):
             try:
                 with open(DASHBOARD_HTML_PATH, "rb") as f:
@@ -351,6 +402,7 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 html = b"<h1>dashboard.html not found - place it next to detect.py</h1>"
             self._send(200, "text/html", html)
+
         elif p == "/snapshot":
             with lock:
                 jpg = shared["latest_frame_jpg"]
@@ -358,6 +410,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "image/jpeg", jpg)
             else:
                 self._send(503, "text/plain", b"No frame yet")
+
         elif p == "/data":
             with lock:
                 body = json.dumps({
@@ -366,6 +419,7 @@ class Handler(BaseHTTPRequestHandler):
                     "status": shared["status"]
                 }).encode()
             self._send(200, "application/json", body)
+
         else:
             self._send(404, "text/plain", b"Not Found")
 
@@ -385,8 +439,8 @@ class Handler(BaseHTTPRequestHandler):
 # ============================================================
 def run_detection():
     criminals = load_criminals("database")
-
     camera = cv2.VideoCapture(0)
+
     if not camera.isOpened():
         print("[ERROR] Could not open the webcam. Is another app using it?")
         with lock:
