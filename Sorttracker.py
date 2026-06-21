@@ -1,4 +1,3 @@
-
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -6,14 +5,13 @@ from scipy.optimize import linear_sum_assignment
 class KalmanFilter:
     """
     Minimal linear Kalman filter (numpy-only, no filterpy dependency).
-
     Standard predict/update equations:
-      Predict:  x = F x            P = F P F^T + Q
-      Update:   y = z - H x        (innovation)
-                S = H P H^T + R
-                K = P H^T S^-1     (Kalman gain)
-                x = x + K y
-                P = (I - K H) P
+        Predict: x = F x         P = F P F^T + Q
+        Update:  y = z - H x     (innovation)
+                 S = H P H^T + R
+                 K = P H^T S^-1  (Kalman gain)
+                 x = x + K y
+                 P = (I - K H) P
     """
 
     def __init__(self, dim_x, dim_z):
@@ -75,7 +73,6 @@ def z_to_bbox(z):
 
 
 class KalmanBoxTracker:
-   
     count = 0
 
     def __init__(self, bbox):
@@ -124,7 +121,20 @@ class KalmanBoxTracker:
         self.age = 0
 
     def update(self, bbox):
-       
+        """
+        Register a new measured detection for this tracker.
+
+        THIS WAS MISSING IN THE ORIGINAL FILE — the method body was empty,
+        so calling tracker.update(bbox) silently did nothing: hits/hit_streak
+        never incremented and the Kalman filter never absorbed the new
+        measurement. That meant every tracker behaved as if it were
+        permanently in "predict-only / no detection matched" mode.
+        """
+        self.time_since_update = 0
+        self.history = []
+        self.hits += 1
+        self.hit_streak += 1
+        self.kf.update(bbox_to_z(bbox))
 
     def predict(self):
         """Advance the filter one frame with no new measurement."""
@@ -143,10 +153,8 @@ class KalmanBoxTracker:
 
 
 def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
-    
     if len(trackers) == 0:
         return np.empty((0, 2), dtype=int), np.arange(len(detections)), np.empty((0,), dtype=int)
-
     if len(detections) == 0:
         return np.empty((0, 2), dtype=int), np.empty((0,), dtype=int), np.arange(len(trackers))
 
@@ -175,7 +183,6 @@ def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
 
 
 class Sort:
-   
     def __init__(self, max_age=10, min_hits=3, iou_threshold=0.3):
         self.max_age = max_age
         self.min_hits = min_hits
@@ -184,7 +191,6 @@ class Sort:
         self.frame_count = 0
 
     def update(self, detections):
-        
         self.frame_count += 1
 
         predicted = np.zeros((len(self.trackers), 4))
@@ -218,3 +224,17 @@ class Sort:
         self.trackers = [t for t in self.trackers if t.time_since_update <= self.max_age]
 
         return np.concatenate(results) if results else np.empty((0, 5))
+
+
+if __name__ == "__main__":
+    # Tiny smoke test — proves update() now actually changes tracker state.
+    # Two "frames" of a single box moving 5px to the right each time.
+    tracker = Sort(max_age=5, min_hits=1, iou_threshold=0.2)
+
+    frame1 = np.array([[100, 100, 160, 180]], dtype=float)
+    frame2 = np.array([[105, 100, 165, 180]], dtype=float)
+    frame3 = np.array([[110, 100, 170, 180]], dtype=float)
+
+    for i, dets in enumerate([frame1, frame2, frame3], start=1):
+        out = tracker.update(dets)
+        print(f"frame {i} -> tracks:\n{out}")
