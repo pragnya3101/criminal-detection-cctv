@@ -1,7 +1,17 @@
 # ============================================================
-#  CCTV Criminal Detection — detect.py
+# CCTV Criminal Detection — detect.py
+#
+# PATCH NOTES (for Evaluate.py integration):
+#   - face_detector is now created once at module level instead of
+#     inside run_detection(), so other modules (Evaluate.py) can reuse
+#     the exact same Haar cascade instance.
+#   - Added detect_faces(img) and recognize_face(img, box, db) as
+#     reusable top-level functions. These wrap the same logic that was
+#     previously inlined in run_detection()/recognize_arcface(), so
+#     live-pipeline behavior is unchanged — Evaluate.py now calls real
+#     functions instead of detect.detect_faces / detect.recognize_face
+#     that never existed before.
 # ============================================================
-
 import cv2
 import os
 import json
@@ -12,11 +22,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # --- CONFIGURATION ---
 ARCFACE_THRESHOLD = 0.50
-PIXEL_THRESHOLD   = 70
-STICKY_FRAMES     = 20   # Keeps a name label visible for ~0.7s after the last positive match
-RECOG_EVERY       = 2    # Only run the (expensive) recognition model every 2nd frame
-COOLDOWN_SEC      = 10   # Minimum gap between snapshots of the same person
-
+PIXEL_THRESHOLD = 70
+STICKY_FRAMES = 20       # Keeps a name label visible for ~0.7s after the last positive match
+RECOG_EVERY = 2          # Only run the (expensive) recognition model every 2nd frame
+COOLDOWN_SEC = 10        # Minimum gap between snapshots of the same person
 DASHBOARD_HTML_PATH = "dashboard.html"
 
 try:
@@ -26,6 +35,12 @@ try:
 except ImportError:
     ARCFACE_AVAILABLE = False
     print("[INFO] DeepFace not found. Using pixel-difference fallback.")
+
+# Module-level cascade so Evaluate.py (and anything else) can reuse it
+# without spinning up a second copy or duplicating the XML path lookup.
+_face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
 shared = {
     "detections": [],
@@ -43,7 +58,7 @@ lock = threading.Lock()
 
 
 # ============================================================
-#  FACE TRACKING
+# FACE TRACKING
 # ============================================================
 class FaceTracker:
     """
@@ -119,7 +134,7 @@ class FaceTracker:
 
 
 # ============================================================
-#  DATABASE & RECOGNITION
+# DATABASE & RECOGNITION
 # ============================================================
 def load_criminals(folder="database"):
     db = []
@@ -136,10 +151,6 @@ def load_criminals(folder="database"):
 
         if ARCFACE_AVAILABLE:
             try:
-                # Haar Cascade still does the fast per-frame face *detection* below,
-                # but here DeepFace re-detects and aligns the face within the crop using
-                # RetinaFace, which is far more accurate than Haar — better alignment
-                # means a cleaner embedding and fewer false matches.
                 result = DeepFace.represent(
                     img_path=path, model_name="ArcFace",
                     detector_backend="retinaface", enforce_detection=False
@@ -154,7 +165,21 @@ def load_criminals(folder="database"):
             if img is not None:
                 db.append({"name": name, "photo": img, "path": path})
                 print(f"[DB] Loaded (pixel): {name}")
+
     return db
+
+
+def detect_faces(img):
+    """
+    Run Haar Cascade face detection on a BGR image and return a list of
+    (x, y, w, h) boxes. Pulled out as a standalone function (it used to
+    be inlined inside run_detection()'s while loop) so Evaluate.py and
+    any future script can detect faces the exact same way the live
+    pipeline does, instead of reimplementing it.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    boxes = _face_cascade.detectMultiScale(gray, 1.05, 4, minSize=(60, 60))
+    return list(boxes)
 
 
 def cosine_similarity(a, b):
@@ -170,6 +195,7 @@ def recognize_arcface(face_bgr, db):
             detector_backend="retinaface", enforce_detection=False
         )
         live_emb = result[0]["embedding"]
+
         best_name, best_score = None, 0.0
         for c in db:
             sim = cosine_similarity(live_emb, c["embedding"])
@@ -177,13 +203,14 @@ def recognize_arcface(face_bgr, db):
                 best_score = sim
                 if sim >= ARCFACE_THRESHOLD:
                     best_name = c["name"]
+
         if best_name:
             # Rescale so the confidence shown to the user starts at 0% right at the
             # match threshold rather than at the raw (and less intuitive) cosine score.
             conf = int((best_score - ARCFACE_THRESHOLD) / (1.0 - ARCFACE_THRESHOLD) * 100)
             return best_name, max(0, min(99, conf))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] ArcFace recognition failed: {e}")
     return None, 0
 
 
@@ -199,6 +226,60 @@ def recognize_pixel(face_gray, db):
     if best_name:
         return best_name, max(0, min(99, int((1 - best_score / PIXEL_THRESHOLD) * 100)))
     return None, 0
+
+
+def recognize_face(img, box, db):
+    """
+    Evaluation-friendly wrapper: given a full BGR image and a single
+    (x, y, w, h) box, crop the face and run recognition against db,
+    returning (name_or_None, raw_cosine_similarity).
+
+    This is intentionally separate from recognize_arcface()/recognize_pixel(),
+    which the live webcam loop uses and which return a *rescaled* 0-99
+    "confidence" for display. Evaluate.py needs to compare directly
+    against ARCFACE_THRESHOLD (a raw cosine-similarity cutoff), so this
+    wrapper returns the raw similarity score, not the rescaled one —
+    mixing those two scales was the root cause of Evaluate.py's original
+    (broken) threshold comparison.
+    """
+    x, y, w, h = box
+    face_crop = img[y:y + h, x:x + w]
+
+    if not db:
+        return None, 0.0
+
+    if ARCFACE_AVAILABLE:
+        try:
+            result = DeepFace.represent(
+                img_path=face_crop, model_name="ArcFace",
+                detector_backend="retinaface", enforce_detection=False
+            )
+            live_emb = result[0]["embedding"]
+        except Exception as e:
+            print(f"[WARN] ArcFace recognition failed: {e}")
+            return None, 0.0
+
+        best_name, best_score = None, 0.0
+        for c in db:
+            sim = cosine_similarity(live_emb, c["embedding"])
+            if sim > best_score:
+                best_score = sim
+                best_name = c["name"] if sim >= ARCFACE_THRESHOLD else None
+        return best_name, best_score
+
+    else:
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+        face_r = cv2.resize(gray, (100, 100))
+        best_name, best_score = None, 999
+        for c in db:
+            score = float(cv2.absdiff(face_r, cv2.resize(c["photo"], (100, 100))).mean())
+            if score < best_score:
+                best_score = score
+                best_name = c["name"] if score < PIXEL_THRESHOLD else None
+        # Return a "similarity-like" score (higher = better) for consistency,
+        # even though pixel-diff is naturally a distance (lower = better).
+        normalized = max(0.0, 1.0 - best_score / PIXEL_THRESHOLD) if best_score < 999 else 0.0
+        return best_name, normalized
 
 
 def save_snapshot(frame, name):
@@ -225,10 +306,11 @@ def log_detection(face_id, name, is_criminal, conf, algo_label):
             last_for_face is None
             or last_for_face["name"] != name
             or (now_dt - datetime.datetime.strptime(
-                    last_for_face["date"] + " " + last_for_face["time"],
-                    "%Y-%m-%d %H:%M:%S")
+                last_for_face["date"] + " " + last_for_face["time"],
+                "%Y-%m-%d %H:%M:%S")
                 ).seconds > 5
         )
+
         if should_log:
             shared["detections"].append({
                 "face_id": face_id,
@@ -243,6 +325,7 @@ def log_detection(face_id, name, is_criminal, conf, algo_label):
             # cap the underlying list would grow forever for as long as the server runs.
             if len(shared["detections"]) > 200:
                 shared["detections"] = shared["detections"][-200:]
+
             shared["stats"]["total_faces"] += 1
             if is_criminal:
                 shared["stats"]["total_criminals"] += 1
@@ -251,10 +334,9 @@ def log_detection(face_id, name, is_criminal, conf, algo_label):
 
 
 # ============================================================
-#  WEB SERVER
+# WEB SERVER
 # ============================================================
 class Handler(BaseHTTPRequestHandler):
-
     def _path(self):
         # The browser appends a cache-busting timestamp (?12345) to /snapshot
         # and /data requests, so strip the query string before matching routes.
@@ -262,7 +344,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = self._path()
-
         if p in ("/", "/index.html"):
             try:
                 with open(DASHBOARD_HTML_PATH, "rb") as f:
@@ -270,7 +351,6 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 html = b"<h1>dashboard.html not found - place it next to detect.py</h1>"
             self._send(200, "text/html", html)
-
         elif p == "/snapshot":
             with lock:
                 jpg = shared["latest_frame_jpg"]
@@ -278,7 +358,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "image/jpeg", jpg)
             else:
                 self._send(503, "text/plain", b"No frame yet")
-
         elif p == "/data":
             with lock:
                 body = json.dumps({
@@ -287,7 +366,6 @@ class Handler(BaseHTTPRequestHandler):
                     "status": shared["status"]
                 }).encode()
             self._send(200, "application/json", body)
-
         else:
             self._send(404, "text/plain", b"Not Found")
 
@@ -303,12 +381,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ============================================================
-#  MAIN LOOP
+# MAIN LOOP
 # ============================================================
 def run_detection():
-    face_detector = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
     criminals = load_criminals("database")
 
     camera = cv2.VideoCapture(0)
@@ -333,10 +408,9 @@ def run_detection():
         if not ok:
             print("[WARN] Lost the camera feed, stopping.")
             break
-        frame_n += 1
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        boxes = face_detector.detectMultiScale(gray, 1.05, 4, minSize=(60, 60))
+        frame_n += 1
+        boxes = detect_faces(frame)
         tracked_faces = tracker.update(boxes)
 
         for face_id, (x, y, w, h) in tracked_faces:
@@ -346,7 +420,8 @@ def run_detection():
                 if ARCFACE_AVAILABLE:
                     matched, conf = recognize_arcface(frame[y:y + h, x:x + w], criminals)
                 else:
-                    matched, conf = recognize_pixel(gray[y:y + h, x:x + w], criminals)
+                    gray_crop = cv2.cvtColor(frame[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+                    matched, conf = recognize_pixel(gray_crop, criminals)
 
                 if matched:
                     tracker.set_sticky(face_id, matched, conf, STICKY_FRAMES)
@@ -392,4 +467,10 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("", 5000), Handler).serve_forever(),
         daemon=True
     ).start()
-    run_detection()
+
+    try:
+        run_detection()
+    except Exception as e:
+        print(f"[FATAL] {e}")
+        with lock:
+            shared["status"] = "error"
